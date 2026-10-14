@@ -1,0 +1,7 @@
+# Runtime dependencies for scripts/pocket_sync.py (the bulk ROM uploader).
+#
+# requests — HTTP client for the Worker's JSON + raw-bytes APIs, with the
+#            per-thread session and cookie handling the script relies on.
+# tqdm     — progress bar for the upload pool.
+requests>=2.31,<3
+tqdm>=4.66,<5

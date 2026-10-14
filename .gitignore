@@ -20,3 +20,8 @@ coverage/
 
 # Local planning notes. Never commit.
 ideas/
+
+# Python tooling for scripts/pocket_sync.py.
+.venv/
+__pycache__/
+*.py[cod]
