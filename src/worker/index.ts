@@ -31,7 +31,7 @@ import { handleLink } from "./link";
 import { handleRoms } from "./roms";
 import { handleInvitePreview, handleSocial, recordSaveScores } from "./social";
 import { track, trackSeen } from "./stats";
-import { allow, handleStates } from "./toolkit";
+import { allow, handleStates, runMaintenance } from "./toolkit";
 
 export { AuthDO } from "./durable-objects/AuthDO";
 export { PlayerSaveDO } from "./durable-objects/PlayerSaveDO";
@@ -77,6 +77,15 @@ export default {
     } catch (err) {
       console.error(JSON.stringify({ message: "unhandled error", path: url.pathname, error: String(err) }));
       return withRobotsTag(url, json({ error: "internal_error" }, 500));
+    }
+  },
+
+  /** Nightly R2 ROM-library reconciliation (see `triggers.crons`). */
+  async scheduled(_controller: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
+    try {
+      await runMaintenance(env);
+    } catch (err) {
+      console.error(JSON.stringify({ message: "unhandled error", path: "scheduled", error: String(err) }));
     }
   },
 } satisfies ExportedHandler<Env>;

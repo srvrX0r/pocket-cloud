@@ -8,6 +8,10 @@
 	"observability": {
 		"enabled": true
 	},
+	// Nightly ROM-library reconciliation: runs scheduled() in src/worker/index.ts.
+	"triggers": {
+		"crons": ["17 4 * * *"]
+	},
 	"routes": [
 		{
 			"pattern": "pocketcloud.app",
@@ -128,9 +132,11 @@
 	// Cloudflare Access app "Pocket Cloud admin" (Zero Trust) guards /admin* and
 	// /api/admin/*; the Worker checks its token against these (see src/worker/access.ts).
 	// Who may open the admin page is the "Pocket Cloud admins" Access policy.
+	// MAINTENANCE_APPLY gates the maintenance cron's deletes: dry run until "1".
 	"vars": {
 		"ACCESS_TEAM_DOMAIN": "marcialcabrera.cloudflareaccess.com",
-		"ACCESS_AUD": "c4d7902e5a24d1ef3eb669fb697cec9dd7f79013f627cee73bf64fb6d2de2660"
+		"ACCESS_AUD": "c4d7902e5a24d1ef3eb669fb697cec9dd7f79013f627cee73bf64fb6d2de2660",
+		"MAINTENANCE_APPLY": "0"
 	},
 	// Secret (not in this file): SESSION_SECRET, at least 32 characters.
 	//   pnpm wrangler secret put SESSION_SECRET

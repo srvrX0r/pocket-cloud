@@ -2,6 +2,7 @@ import {
   HASH_PATTERN,
   MAX_STATE_BYTES,
   MAX_STATE_LABEL,
+  MIN_ROM_BYTES,
   base64ToBytes,
   bytesToBase64,
   sha256Hex,
@@ -115,5 +116,87 @@ export async function handleStates(
     default:
       return methodNotAllowed();
   }
+}
+
+
+const ROM_KEY = /^roms\/([^/]+)\/([0-9a-f]{64})$/;
+const REMOVED_KEY = /^removed\/([^/]+)\/([0-9a-f]{64})$/;
+const LIST_PAGE = 1000;
+
+type PlayerStats = { roms: number; romBytes: number; removed: number };
+
+function playerStats(map: Map<string, PlayerStats>, playerId: string): PlayerStats {
+  let stats = map.get(playerId);
+  if (!stats) {
+    stats = { roms: 0, romBytes: 0, removed: 0 };
+    map.set(playerId, stats);
+  }
+  return stats;
+}
+
+/**
+ * Nightly reconciliation of the R2 ROM library (see `triggers.crons` in
+ * wrangler.jsonc). It walks every object, groups them by player and reports
+ * what it found; interrupted uploads (an object under `roms/<playerId>/`
+ * smaller than MIN_ROM_BYTES) are only deleted when MAINTENANCE_APPLY is "1",
+ * so the first runs are a dry run.
+ */
+export async function runMaintenance(env: Env): Promise<void> {
+  const apply = (env as unknown as { MAINTENANCE_APPLY?: string }).MAINTENANCE_APPLY === "1";
+
+  const players = new Map<string, PlayerStats>();
+  const suspects: { key: string; size: number }[] = [];
+  const foreign: { key: string; size: number }[] = [];
+  let romObjects = 0;
+  let removedMarkers = 0;
+  let romBytesTotal = 0;
+
+  let cursor: string | undefined;
+  do {
+    const page = await env.ROMS.list({ limit: LIST_PAGE, ...(cursor ? { cursor } : {}) });
+    for (const object of page.objects) {
+      const romMatch = ROM_KEY.exec(object.key);
+      if (romMatch) {
+        romObjects++;
+        romBytesTotal += object.size;
+        const stats = playerStats(players, romMatch[1]!);
+        stats.roms++;
+        stats.romBytes += object.size;
+        if (object.size < MIN_ROM_BYTES) suspects.push({ key: object.key, size: object.size });
+        continue;
+      }
+      const removedMatch = REMOVED_KEY.exec(object.key);
+      if (removedMatch) {
+        removedMarkers++;
+        playerStats(players, removedMatch[1]!).removed++;
+        continue;
+      }
+      foreign.push({ key: object.key, size: object.size });
+    }
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+
+  let deletedSuspects = 0;
+  if (apply && suspects.length > 0) {
+    for (let i = 0; i < suspects.length; i += LIST_PAGE) {
+      await env.ROMS.delete(suspects.slice(i, i + LIST_PAGE).map((s) => s.key));
+    }
+    deletedSuspects = suspects.length;
+  }
+
+  console.log(
+    JSON.stringify({
+      message: "maintenance",
+      apply,
+      romObjects,
+      romBytesTotal,
+      removedMarkers,
+      foreignKeys: foreign.length,
+      ...(foreign.length > 0 ? { foreignSample: foreign.slice(0, 10) } : {}),
+      players: [...players.entries()].map(([playerId, stats]) => ({ playerId, ...stats })),
+      suspectObjects: suspects,
+      deletedSuspects,
+    }),
+  );
 }
 
