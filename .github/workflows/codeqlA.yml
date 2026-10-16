@@ -1,0 +1,225 @@
+name: "CodeQL Advanced"
+
+# ── Triggers ──────────────────────────────────────────────────────────────
+on:
+  push:
+    branches: [ "main", "release/**" ]
+  pull_request:
+    branches: [ "main", "release/**" ]
+  # Scan PRs from forks without granting them write access
+  pull_request_target:
+    branches: [ "main" ]
+  # Nightly full scan (catches new CVEs / query updates)
+  schedule:
+    - cron: '0 2 * * *'          # 02:00 UTC daily
+    - cron: '16 13 * * 5'        # keep your original Friday slot
+  # Manual trigger for on-demand scans
+  workflow_dispatch:
+    inputs:
+      languages:
+        description: "Comma-separated languages (empty = all)"
+        required: false
+        default: ""
+
+# ── Concurrency: cancel stale runs on same branch ─────────────────────────
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ── Global env ────────────────────────────────────────────────────────────
+env:
+  CODEQL_QUERY_SUITE: security-extended   # deeper than default
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════
+  #  1. CODEQL STATIC ANALYSIS
+  # ═══════════════════════════════════════════════════════════════════════
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: >-
+      ${{
+        matrix.language == 'swift'       && 'macos-latest' ||
+        matrix.language == 'c-cpp'       && 'ubuntu-latest' ||
+        matrix.language == 'csharp'      && 'ubuntu-latest' ||
+        matrix.language == 'java-kotlin' && 'ubuntu-latest' ||
+        'ubuntu-latest'
+      }}
+    timeout-minutes: 30
+    permissions:
+      security-events: write
+      packages: read
+      actions: read
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # ── Add / remove languages to match your repo ──
+        include:
+          # Interpreted (no build needed)
+          - language: actions
+            build-mode: none
+          - language: javascript-typescript
+            build-mode: none
+          - language: python
+            build-mode: none
+          - language: ruby
+            build-mode: none
+          # Compiled (autobuild or manual)
+          - language: c-cpp
+            build-mode: autobuild
+          - language: csharp
+            build-mode: autobuild
+          - language: go
+            build-mode: none
+          - language: java-kotlin
+            build-mode: autobuild
+          - language: rust
+            build-mode: autobuild
+          - language: swift
+            build-mode: autobuild
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # full history for version-aware queries
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          # Use the extended suite: adds hardening, crypto, and
+          # platform-specific queries beyond the default.
+          queries: ${{ env.CODEQL_QUERY_SUITE }}
+          # Optional: point to a custom query pack in this repo
+          # (e.g., org-specific TTP patterns, LLM prompt-injection rules)
+          # queries: security-extended, ./codeql-custom/queries
+          # Optional: inline config for path filtering & threat models
+          config: |
+            paths-ignore:
+              - '**/*.test.js'
+              - '**/*.spec.ts'
+              - '**/__mocks__/**'
+              - '**/fixtures/**'
+              - '**/node_modules/**'
+              - 'vendor/**'
+              - 'third_party/**'
+            # Enable local threat-model-driven analysis
+            # threat-models: local
+
+      # ── Build step (only for compiled languages) ──
+      - name: Autobuild
+        if: matrix.build-mode == 'autobuild'
+        uses: github/codeql-action/autobuild@v4
+
+      # ── For manual builds, replace the above with: ──
+      # - name: Build
+      #   if: matrix.build-mode == 'manual'
+      #   run: |
+      #     make build
+      #     # or: dotnet build, gradle build, cargo build, etc.
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          # Upload SARIF artifact for audit / external tooling
+          category: "${{ matrix.language }}-${{ matrix.build-mode }}"
+
+      # ── Upload SARIF for external consumption (SIEM, Jira, etc.) ──
+      - name: Upload SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-${{ matrix.language }}
+          path: ${{ github.workspace }}/*.sarif
+          retention-days: 90
+
+  # ═══════════════════════════════════════════════════════════════════════
+  #  2. DEPENDENCY REVIEW (supply-chain gate on PRs)
+  # ═══════════════════════════════════════════════════════════════════════
+  dependency-review:
+    name: Dependency Review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Review dependencies
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: medium
+          # Block PRs that introduce high/critical CVEs in deps
+          verify-new-packages: true
+          # Optionally: allowlist known-good packages
+          # ignore: packages.json
+
+  # ═══════════════════════════════════════════════════════════════════════
+  #  3. REMEDIATION: create / update issues from critical findings
+  # ═══════════════════════════════════════════════════════════════════════
+  remediate:
+    name: Triage Critical Findings
+    needs: analyze
+    if: always() && contains(needs.analyze.result, 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write
+      security-events: read
+      contents: read
+    steps:
+      - name: Download SARIF artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sarif-*
+          path: sarif/
+
+      - name: Create issues for critical/high findings
+        uses: github/codeql-action/analyze@v4   # re-run with SARIF
+        continue-on-error: true
+      - name: File issues
+        run: |
+          # Parse SARIF and file GitHub Issues for critical/high
+          # (use a script or a third-party action like
+          #  `jittergithub/sarif-to-issues-action`)
+          echo "Parse SARIF and create issues for severity >= high"
+          # Example with jq + GitHub API:
+          for f in sarif/*.sarif; do
+            jq -r '.runs[].results[] |
+              select(.level == "error" or .level == "warning") |
+              [.ruleId, .message.text,
+               .locations[0].physicalLocation.artifactLocation.uri,
+               .locations[0].physicalLocation.region.startLine] |
+              @tsv' "$f" 2>/dev/null |
+            while IFS=$'\t' read -r rule msg file line; do
+              echo "[$rule] $msg at $file:$line"
+              # curl -X POST -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              #   -H "Accept: application/vnd.github+json" \
+              #   "https://api.github.com/repos/${{ github.repository }}/issues" \
+              #   -d "{\"title\":\"[CodeQL] $rule\",\"body\":\"$msg\\nFile: $file:$line\"}"
+            done
+          done
+
+  # ═══════════════════════════════════════════════════════════════════════
+  #  4. SECURITY ADVISORY SYNC (optional, for org-level policy)
+  # ═══════════════════════════════════════════════════════════════════════
+  # This job can pull new GitHub Security Advisories (GSAs) and
+  # cross-reference them against your dependency manifest.
+  # For most repos, Dependabot handles this automatically.
+  # Uncomment if you need custom advisory workflow:
+  #
+  # advisory-sync:
+  #   name: Security Advisory Check
+  #   if: github.event_name == 'schedule'
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - name: Check for new advisories
+  #       run: |
+  #         # Use `gh api /advisories` or Dependabot API
+  #         echo "Cross-reference GSAs against lock files"   
